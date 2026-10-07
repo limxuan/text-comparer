@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# compare - diff two text files and keep a history of comparisons.
+#
+# Usage: ./compare [options] [fileA] [fileB]
+#
+set -u
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HISTORY_DIR="$SCRIPT_DIR/history"
+
+name=""
+side_by_side=0
+color_mode="auto"
+context=""
+save=1
+list_only=0
+clean=0
+files=()
+
+usage() {
+    cat <<'EOF'
+compare - diff two text files and keep a history of comparisons.
+
+Usage:
+  ./compare [options] [fileA] [fileB]
+
+Defaults to fileA.txt and fileB.txt when no files are given.
+
+Options:
+  -n, --name NAME      Label this comparison (used first in the saved filename)
+  -s, --side-by-side   Show a side-by-side diff
+      --color          Force colored output
+      --no-color       Disable colored output
+  -c, --context N      Number of context lines to show (default: 3)
+      --no-save        Print the diff without saving it to history/
+      --list           List past comparisons
+      --clean          Delete the history/ folder
+  -h, --help           Show this help
+
+Saved filenames always include a timestamp, placed after the name if one
+is given:  [<name>-]<timestamp>-<A>-vs-<B>.diff
+
+Examples:
+  ./compare
+  ./compare a.txt b.txt
+  ./compare -n release-v1 a.txt b.txt
+  ./compare -s --no-color a.txt b.txt
+  ./compare --list
+EOF
+}
+
+err() { printf 'compare: %s\n' "$1" >&2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--name)       name="${2-}"; shift 2 ;;
+        -s|--side-by-side) side_by_side=1; shift ;;
+        --color)         color_mode="always"; shift ;;
+        --no-color)      color_mode="never"; shift ;;
+        -c|--context)    context="${2-}"; shift 2 ;;
+        --no-save)       save=0; shift ;;
+        --list)          list_only=1; shift ;;
+        --clean)         clean=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              shift; while [ $# -gt 0 ]; do files+=("$1"); shift; done ;;
+        -*)              err "unknown option: $1"; usage; exit 2 ;;
+        *)               files+=("$1"); shift ;;
+    esac
+done
+
+if [ "$clean" -eq 1 ]; then
+    if [ -d "$HISTORY_DIR" ]; then
+        rm -rf -- "$HISTORY_DIR"
+        echo "History cleared: $HISTORY_DIR"
+    else
+        echo "No history to clear."
+    fi
+    exit 0
+fi
+
+if [ "$list_only" -eq 1 ]; then
+    if [ ! -d "$HISTORY_DIR" ] || [ -z "$(ls -A "$HISTORY_DIR" 2>/dev/null)" ]; then
+        echo "No saved comparisons yet."
+        exit 0
+    fi
+    printf '%-60s %s\n' "FILE" "SIZE"
+    for f in "$HISTORY_DIR"/*.diff; do
+        [ -e "$f" ] || continue
+        printf '%-60s %s\n' "$(basename -- "$f")" "$(wc -c < "$f") bytes"
+    done
+    exit 0
+fi
+
+file_a="${files[0]:-fileA.txt}"
+file_b="${files[1]:-fileB.txt}"
+
+if [ ! -f "$file_a" ]; then err "file not found: $file_a"; exit 1; fi
+if [ ! -f "$file_b" ]; then err "file not found: $file_b"; exit 1; fi
+
+base_a="$(basename -- "$file_a")"
+base_b="$(basename -- "$file_b")"
+
+context_args=()
+[ -n "$context" ] && context_args+=("--unified=$context")
+
+if [ "$color_mode" = "auto" ]; then
+    if [ -t 1 ]; then color_mode="always"; else color_mode="never"; fi
+fi
+
+have_git=0
+command -v git >/dev/null 2>&1 && have_git=1
+
+# Plain, uncolored unified diff (used for stats and the history backup).
+unified_plain() {
+    if [ "$have_git" -eq 1 ]; then
+        GIT_PAGER=cat git --no-pager diff --no-index --no-color \
+            "${context_args[@]}" -- "$file_a" "$file_b" 2>&1
+    else
+        diff -u "${context_args[@]}" -- "$file_a" "$file_b" 2>&1
+    fi
+}
+
+# Colored unified diff for the terminal.
+unified_display() {
+    if [ "$have_git" -eq 1 ]; then
+        local c="never"
+        [ "$color_mode" = "always" ] && c="always"
+        GIT_PAGER=cat git --no-pager diff --no-index --color="$c" \
+            "${context_args[@]}" -- "$file_a" "$file_b"
+    else
+        local ca=()
+        [ "$color_mode" = "always" ] && ca+=("--color=always")
+        diff -u "${ca[@]}" "${context_args[@]}" -- "$file_a" "$file_b"
+    fi
+}
+
+# Run the comparison up front so the terminal and the backup share it.
+plain="$(unified_plain)"
+status=$?
+
+lines_a="$(awk 'END{print NR}' "$file_a")"
+lines_b="$(awk 'END{print NR}' "$file_b")"
+
+read -r added removed hunks < <(
+    printf '%s\n' "$plain" | awk '
+        /^\+/ && !/^\+\+\+/ {a++}
+        /^-/  && !/^---/   {d++}
+        /^@@/             {h++}
+        END {print a+0, d+0, h+0}'
+)
+
+if [ "$status" -eq 0 ]; then
+    status_text="identical"
+elif [ "$status" -eq 1 ]; then
+    status_text="differ"
+else
+    err "diff failed (exit $status)"
+    exit "$status"
+fi
+
+# ---- Summary ----
+printf '\n'
+printf '  %s  ->  %s\n' "$base_a" "$base_b"
+printf '  lines %s -> %s   changes +%s -%s   hunks %s   status: %s\n' \
+    "$lines_a" "$lines_b" "$added" "$removed" "$hunks" "$status_text"
+printf '  %s\n\n' "------------------------------------------------------------"
+
+# ---- Diff ----
+if [ "$status" -eq 0 ]; then
+    printf '  (no differences)\n'
+elif [ "$side_by_side" -eq 1 ]; then
+    diff --side-by-side "${context_args[@]}" -- "$file_a" "$file_b"
+else
+    unified_display
+fi
+
+# ---- History backup ----
+if [ "$save" -eq 1 ]; then
+    mkdir -p -- "$HISTORY_DIR"
+    prefix=""
+    # Timestamp is always included; when a name is given it comes first.
+    [ -n "$name" ] && prefix="${name}-"
+    prefix="${prefix}$(date +%Y%m%d-%H%M%S)-"
+    out="$HISTORY_DIR/${prefix}${base_a}-vs-${base_b}.diff"
+    if [ -e "$out" ]; then
+        n=1
+        stem="${out%.diff}"
+        while [ -e "${stem}-${n}.diff" ]; do n=$((n + 1)); done
+        out="${stem}-${n}.diff"
+    fi
+
+    {
+        echo "# compare: $file_a vs $file_b"
+        echo "# date: $(date -Is)"
+        [ -n "$name" ] && echo "# name: $name"
+        echo "# lines: $lines_a -> $lines_b  changes: +$added -$removed  hunks: $hunks"
+        echo
+        printf '%s\n' "$plain"
+    } > "$out"
+
+    printf '\n  saved: %s\n' "$out"
+fi
+exit 0
